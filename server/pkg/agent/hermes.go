@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -57,6 +58,30 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	env := buildEnv(b.cfg.Env)
 	// Enable yolo mode so Hermes auto-approves all tool executions.
 	env = append(env, "HERMES_YOLO_MODE=1")
+	// If LITELLM_MASTER_KEY is set, create a temporary Hermes home
+	// with a custom .env that overrides the API keys so the daemon
+	// controls which credentials Hermes uses to call the local
+	// LiteLLM proxy (switchboard).
+	var hermesTempHome string
+	if mk := os.Getenv("LITELLM_MASTER_KEY"); mk != "" {
+		var err error
+		hermesTempHome, err = os.MkdirTemp("", "multica-hermes-home-")
+		if err == nil {
+// temp home cleanup moved to lifecycle goroutine
+			realHome := os.Getenv("HOME") + "/.hermes"
+			if cfgData, rerr := os.ReadFile(realHome + "/config.yaml"); rerr == nil {
+				os.WriteFile(hermesTempHome+"/config.yaml", cfgData, 0600)
+			}
+			envContent := "LITELLM_MASTER_KEY=" + mk + "\nOPENAI_API_KEY=" + mk + "\nOPENROUTER_API_KEY=" + mk + "\n"
+			envPath := hermesTempHome + "/.env"
+			if werr := os.WriteFile(envPath, []byte(envContent), 0600); werr != nil {
+				b.cfg.Logger.Warn("failed to write hermes temp .env", "path", envPath, "error", werr)
+			} else {
+				b.cfg.Logger.Info("wrote hermes temp .env with master key", "path", envPath)
+			}
+			env = append(env, "HERMES_HOME="+hermesTempHome)
+		}
+	}
 	cmd.Env = env
 
 	stdout, err := cmd.StdoutPipe()
@@ -154,6 +179,9 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		defer func() {
 			stdin.Close()
 			_ = cmd.Wait()
+			if hermesTempHome != "" {
+				os.RemoveAll(hermesTempHome)
+			}
 		}()
 
 		startTime := time.Now()
@@ -162,7 +190,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		var sessionID string
 
 		// 1. Initialize handshake.
-		_, err := c.request(runCtx, "initialize", map[string]any{
+		initResult, err := c.request(runCtx, "initialize", map[string]any{
 			"protocolVersion": 1,
 			"clientInfo": map[string]any{
 				"name":    "multica-agent-sdk",
@@ -175,6 +203,35 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			finalError = fmt.Sprintf("hermes initialize failed: %v", err)
 			resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 			return
+		}
+
+		// 1a. If the daemon has LITELLM_MASTER_KEY and Hermes advertises
+		// the "custom" auth method, authenticate with the master key so
+		// that Hermes uses it to call the local LiteLLM proxy (switchboard)
+		// instead of its own configured credentials.
+		if mk := os.Getenv("LITELLM_MASTER_KEY"); mk != "" {
+			var initResp struct {
+				AuthMethods []struct {
+					ID string `json:"id"`
+				} `json:"authMethods"`
+			}
+			if json.Unmarshal(initResult, &initResp) == nil {
+				for _, m := range initResp.AuthMethods {
+					if m.ID == "custom" {
+						if _, err := c.request(runCtx, "authenticate", map[string]any{
+							"methodId": m.ID,
+							"credentials": map[string]string{
+								"apiKey": mk,
+							},
+						}); err != nil {
+							b.cfg.Logger.Warn("hermes auth with master key failed", "error", err)
+						} else {
+							b.cfg.Logger.Info("hermes authenticated with switchboard master key")
+						}
+						break
+					}
+				}
+			}
 		}
 
 		// 2. Create or resume a session.

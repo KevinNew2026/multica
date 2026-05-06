@@ -5,9 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"fmt"
 	"os/exec"
 	"strings"
 	"sync"
@@ -68,8 +69,9 @@ func ListModels(ctx context.Context, providerType, executablePath string) ([]Mod
 	case "copilot":
 		return copilotStaticModels(), nil
 	case "hermes":
+		// Dynamic discovery: query the Model Switchboard (LiteLLM) directly.
 		return cachedDiscovery(providerType, func() ([]Model, error) {
-			return discoverHermesModels(ctx, executablePath)
+			return discoverSwitchboardModels(ctx)
 		})
 	case "kimi":
 		return cachedDiscovery(providerType, func() ([]Model, error) {
@@ -206,6 +208,19 @@ func copilotStaticModels() []Model {
 	return []Model{
 		{ID: "gpt-5.4", Label: "GPT-5.4", Provider: "openai"},
 		{ID: "claude-sonnet-4-6", Label: "Claude Sonnet 4.6", Provider: "anthropic"},
+	}
+}
+
+// hermesStaticModels reflects the models available through the local
+// Model Switchboard (LiteLLM cloud + local). These are the same models
+// shown in Telegram /model picker.
+func hermesStaticModels() []Model {
+	return []Model{
+		{ID: "deepseek-v4-pro", Label: "DeepSeek V4 Pro", Provider: "custom", Default: true},
+		{ID: "deepseek-v4-flash", Label: "DeepSeek V4 Flash", Provider: "custom"},
+		{ID: "gpt-5.5-xhigh", Label: "GPT-5.5 xhigh", Provider: "custom"},
+		{ID: "qwen-clean", Label: "Qwen Clean", Provider: "custom"},
+		{ID: "qwen-brainstorm", Label: "Qwen Brainstorm", Provider: "custom"},
 	}
 }
 
@@ -393,6 +408,66 @@ type acpDiscoveryProvider struct {
 	tmpdirPrefix string
 }
 
+// discoverSwitchboardModels queries the local Model Switchboard (LiteLLM)
+// /v1/models endpoint to discover available models dynamically.
+// Uses LITELLM_MASTER_KEY from environment for authentication.
+func discoverSwitchboardModels(ctx context.Context) ([]Model, error) {
+	baseURL := os.Getenv("MULTICA_SWITCHBOARD_URL")
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:4000/v1"
+	}
+	apiKey := os.Getenv("LITELLM_MASTER_KEY")
+	if apiKey == "" {
+		// Fallback: try OPENAI_API_KEY (Hermes often sets this)
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+	if apiKey == "" {
+		return []Model{}, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(baseURL, "/")+"/models", nil)
+	if err != nil {
+		return []Model{}, nil
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return []Model{}, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return []Model{}, nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return []Model{}, nil
+	}
+
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return []Model{}, nil
+	}
+
+	models := make([]Model, 0, len(result.Data))
+	for i, m := range result.Data {
+		models = append(models, Model{
+			ID:       m.ID,
+			Label:    m.ID,
+			Provider: "custom",
+			Default:  i == 0,
+		})
+	}
+	return models, nil
+}
+
 // discoverACPModels runs the ACP handshake for any agent CLI that
 // implements the standard `initialize` + `session/new` flow and
 // advertises its model catalog in the response under
@@ -452,13 +527,36 @@ func discoverACPModels(ctx context.Context, executablePath string, p acpDiscover
 		return err
 	}
 
-	// Send initialize + session/new.
+	// Send initialize.
 	if err := writeACP(1, "initialize", map[string]any{
 		"protocolVersion":    1,
 		"clientInfo":         map[string]any{"name": p.clientName, "version": "0.1.0"},
 		"clientCapabilities": map[string]any{},
 	}); err != nil {
 		return []Model{}, nil
+	}
+
+	// Create scanner early so we can read the initialize response
+	// before sending session/new — ACP requires the handshake to
+	// complete before the next request.
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 4*1024*1024)
+
+	// Read initialize response (id=1) before proceeding.
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var env struct {
+			ID json.Number `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(line), &env); err != nil {
+			continue
+		}
+		if env.ID.String() == "1" {
+			break
+		}
 	}
 
 	// session/new requires a valid cwd — use a temp directory we
@@ -478,8 +576,6 @@ func discoverACPModels(ctx context.Context, executablePath string, p acpDiscover
 	}
 
 	// Read responses until we see the one for id=2 (session/new).
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 4*1024*1024)
 	deadline := time.After(12 * time.Second)
 	done := make(chan []Model, 1)
 	go func() {
