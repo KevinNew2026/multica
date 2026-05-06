@@ -62,24 +62,33 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	// with a custom .env that overrides the API keys so the daemon
 	// controls which credentials Hermes uses to call the local
 	// LiteLLM proxy (switchboard).
-	var hermesTempHome string
+	// If LITELLM_MASTER_KEY is set, use a stable Hermes home under
+	// ~/.multica/hermes-home so that sessions persist across daemon
+	// restarts. The .env is regenerated on every Execute call to
+	// ensure the current master key is always used.
+	var hermesHome string
 	if mk := os.Getenv("LITELLM_MASTER_KEY"); mk != "" {
-		var err error
-		hermesTempHome, err = os.MkdirTemp("", "multica-hermes-home-")
-		if err == nil {
-// temp home cleanup moved to lifecycle goroutine
+		multicaDir := os.Getenv("HOME") + "/.multica"
+		hermesHome = multicaDir + "/hermes-home"
+		if err := os.MkdirAll(hermesHome, 0700); err == nil {
 			realHome := os.Getenv("HOME") + "/.hermes"
-			if cfgData, rerr := os.ReadFile(realHome + "/config.yaml"); rerr == nil {
-				os.WriteFile(hermesTempHome+"/config.yaml", cfgData, 0600)
+			// Copy config.yaml once (don't overwrite user changes).
+			if _, serr := os.Stat(hermesHome + "/config.yaml"); os.IsNotExist(serr) {
+				if cfgData, rerr := os.ReadFile(realHome + "/config.yaml"); rerr == nil {
+					os.WriteFile(hermesHome+"/config.yaml", cfgData, 0600)
+				}
 			}
+			// Always rewrite .env with the current master key.
 			envContent := "LITELLM_MASTER_KEY=" + mk + "\nOPENAI_API_KEY=" + mk + "\nOPENROUTER_API_KEY=" + mk + "\n"
-			envPath := hermesTempHome + "/.env"
+			envPath := hermesHome + "/.env"
 			if werr := os.WriteFile(envPath, []byte(envContent), 0600); werr != nil {
-				b.cfg.Logger.Warn("failed to write hermes temp .env", "path", envPath, "error", werr)
+				b.cfg.Logger.Warn("failed to write hermes .env", "path", envPath, "error", werr)
 			} else {
-				b.cfg.Logger.Info("wrote hermes temp .env with master key", "path", envPath)
+				b.cfg.Logger.Info("wrote hermes .env with master key", "path", envPath)
 			}
-			env = append(env, "HERMES_HOME="+hermesTempHome)
+			env = append(env, "HERMES_HOME="+hermesHome)
+		} else {
+			b.cfg.Logger.Warn("failed to create hermes home", "path", hermesHome, "error", err)
 		}
 	}
 	cmd.Env = env
@@ -179,9 +188,6 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		defer func() {
 			stdin.Close()
 			_ = cmd.Wait()
-			if hermesTempHome != "" {
-				os.RemoveAll(hermesTempHome)
-			}
 		}()
 
 		startTime := time.Now()
@@ -251,8 +257,15 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 				return
 			}
-			sessionID = opts.ResumeSessionID
-			_ = result
+			// Use the resolved sessionId from the response, not the
+			// requested one. When the old session doesn't exist (e.g.
+			// after a config/home change), Hermes creates a new one
+			// and returns a different sessionId.
+			sessionID = extractACPSessionID(result)
+			if sessionID == "" {
+				sessionID = opts.ResumeSessionID
+			}
+			b.cfg.Logger.Info("hermes session resumed", "requested", opts.ResumeSessionID, "resolved", sessionID)
 		} else {
 			result, err := c.request(runCtx, "session/new", buildHermesSessionParams(cwd, opts.Model))
 			if err != nil {
